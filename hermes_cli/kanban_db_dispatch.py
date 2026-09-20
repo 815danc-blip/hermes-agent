@@ -3234,7 +3234,7 @@ def run_daemon(
     *,
     interval: float = 60.0,
     max_spawn: Optional[int] = None,
-    failure_limit: int = DEFAULT_FAILURE_LIMIT,
+    failure_limit: Optional[int] = None,
     stop_event=None,
     on_tick=None,
 ) -> None:
@@ -3242,9 +3242,12 @@ def run_daemon(
 
     Calls :func:`dispatch_once` every ``interval`` seconds; exits cleanly on
     SIGINT / SIGTERM so it is systemd-friendly. ``stop_event`` and ``on_tick``
-    are test hooks. Each tick resolves ``kanban.max_in_progress`` exactly like
-    the gateway dispatcher and ``hermes kanban dispatch`` — the standalone
-    daemon must not be the one uncapped entry point.
+    are test hooks. Each tick re-resolves ``kanban.max_in_progress`` exactly
+    like the gateway dispatcher and ``hermes kanban dispatch`` — the standalone
+    daemon must not be the one uncapped entry point. ``max_spawn`` and
+    ``failure_limit`` default from :func:`load_dispatch_config` (re-resolved
+    every tick so operator edits apply without a restart); explicit arguments
+    keep winning for callers that pass them.
     """
     import threading
 
@@ -3267,13 +3270,16 @@ def run_daemon(
         try:
             # Re-resolved every tick (config load is mtime-cached) so operator
             # edits apply without a restart.
+            cfg = load_dispatch_config()
             max_in_progress = resolve_max_in_progress(configured_max_in_progress())
             with contextlib.closing(_kbc.connect()) as conn:
                 res = dispatch_once(
                     conn,
-                    max_spawn=max_spawn,
+                    max_spawn=max_spawn if max_spawn is not None else cfg.max_spawn,
                     max_in_progress=max_in_progress,
-                    failure_limit=failure_limit,
+                    failure_limit=(
+                        failure_limit if failure_limit is not None else cfg.failure_limit
+                    ),
                 )
             if on_tick is not None:
                 with contextlib.suppress(Exception):
