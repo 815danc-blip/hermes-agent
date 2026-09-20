@@ -198,7 +198,11 @@ def _no_cli_transport(monkeypatch, spawned):
             spawned.append(argv)
         raise AssertionError("the CLI transport collides with the live owner")
 
+    # Guard the deliver child's runner, whichever this tree has: subprocess.run today, and
+    # quiet_single_query.run_reported_turn once the relay books turns from their report
+    # (#114980) — guarding only the first would let a real ``hermes chat -Q`` child spawn there.
     monkeypatch.setattr("subprocess.run", _fake_run)
+    monkeypatch.setattr("hermes_cli.quiet_single_query.run_reported_turn", _fake_run, raising=False)
 
 
 def _owner_settles(ops_home, outcome: dict) -> threading.Thread:
