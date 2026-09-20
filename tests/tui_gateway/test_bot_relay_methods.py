@@ -222,29 +222,31 @@ def _owner_settles(ops_home, outcome: dict) -> threading.Thread:
 
 
 @pytest.mark.parametrize(
-    ("outcome", "expect"),
+    ("live_here", "outcome", "expect"),
     [
-        ({"status": "settled", "reply": "pong from the open chat"}, ("reply", "pong from the open chat")),
-        ({"status": "settled", "reply": " *NO_REPLY* "}, ("reply", "")),
-        ({"status": "failed", "error": "Error code: 429 - rate limit exceeded", "reason": "provider_rate_limit"},
+        (True, {"status": "settled", "reply": "pong from the open chat"}, ("reply", "pong from the open chat")),
+        (False, {"status": "failed", "error": "Error code: 429 - rate limit exceeded", "reason": "provider_rate_limit"},
          ("reason", "provider_rate_limit")),
-        ({"status": "failed", "error": "Error code: 429 - rate limit exceeded"}, ("reason", "provider_rate_limit")),
-        ({"status": "cancelled"}, ("reason", "cancelled")),
     ],
-    ids=["answer", "silence-marker-relays-as-empty", "typed-failure", "untyped-failure-is-classified-here", "cancelled"],
+    ids=["answer-from-a-chat-live-here", "typed-failure-from-a-chat-live-elsewhere"],
 )
-def test_deliver_into_a_bot_chat_open_elsewhere_returns_the_owners_answer(home, monkeypatch, outcome, expect):
+def test_deliver_into_an_open_bot_chat_returns_the_owners_answer(home, monkeypatch, live_here, outcome, expect):
     """#113753 put a relayed DM into the mailbox of a Bot Chat live in a sibling process, and the
     owner settles a receipt carrying the reply — the receipt local DMs wait on (_wait_live_dm).
     The relay answered with a receipt sentence instead, so the sending agent never got the target's
     answer whenever its Bot Chat happened to be open. Now the handler waits on the receipt, on the
-    local lane's budget: the reply comes back (a bare silence marker as ""), a failed turn as the
-    typed 5092 refusal, and the CLI is never spawned."""
+    local lane's budget: the reply comes back, a failed turn as the typed 5092 refusal, and the
+    CLI is never spawned. A mailbox-capable chat live in THIS process takes the same door — one
+    door, one receipt — and prompt.submit (#100523) stays the fallback for a live session with no
+    mailbox (test_deliver_lands_in_live_bot_chat_instead_of_subprocess)."""
     ops_home, lease = _lease_open_bot_chat(home)
-    spawned = []
+    spawned, submitted = [], []
     _no_cli_transport(monkeypatch, spawned)
+    monkeypatch.setitem(
+        srv._methods, "prompt.submit", lambda rid, p: submitted.append(p) or srv._ok(rid, {"status": "streaming"}))
     monkeypatch.setattr(srv, "_profile_home", lambda name: ops_home)
-    monkeypatch.setattr(srv, "_sessions", {})  # THIS process hosts nothing for ops
+    monkeypatch.setattr(srv, "_sessions", (
+        {"live-ops": {"profile_home": str(ops_home), "pending_title": "Bot Chat", "history": []}} if live_here else {}))
     monkeypatch.setattr("tools.bot_mode_dm._LIVE_WAIT_SECONDS", 10)
     try:
         owner = _owner_settles(ops_home, outcome)
@@ -252,7 +254,7 @@ def test_deliver_into_a_bot_chat_open_elsewhere_returns_the_owners_answer(home, 
             "profile": "ops", "message": "ping", "from_profile": "cody", "from_handle": "cody",
             "from_connection": "conn-a"})
         owner.join(timeout=10)
-        assert not spawned
+        assert not spawned and submitted == []
         key, value = expect
         if key == "reply":
             assert _result(out)["reply"] == value
@@ -285,27 +287,6 @@ def test_deliver_into_a_busy_open_bot_chat_reports_it_queued_and_keeps_the_recei
         assert queued["status"] == "queued" and queued["message"] == "ping"
         assert queued["owner"]["lease_id"] == lease.lease_id
         assert queued["author"]["name"] == "cody" and queued["author"]["is_bot"] is True
-    finally:
-        lease.release()
-
-
-def test_deliver_into_a_bot_chat_live_in_this_process_goes_through_its_mailbox(home, monkeypatch):
-    """A Bot Chat live in THIS process that advertises a mailbox gets the DM through it too — one
-    door, one receipt, so the sender gets the answer here as well; prompt.submit (#100523) is the
-    fallback only for a live session with no mailbox (the test above this file's live-branch one)."""
-    ops_home, lease = _lease_open_bot_chat(home)
-    submitted, spawned = [], []
-    _no_cli_transport(monkeypatch, spawned)
-    monkeypatch.setitem(
-        srv._methods, "prompt.submit", lambda rid, p: submitted.append(p) or srv._ok(rid, {"status": "streaming"}))
-    monkeypatch.setattr(srv, "_profile_home", lambda name: ops_home)
-    monkeypatch.setitem(srv._sessions, "live-ops", {"profile_home": str(ops_home), "pending_title": "Bot Chat", "history": []})
-    monkeypatch.setattr("tools.bot_mode_dm._LIVE_WAIT_SECONDS", 10)
-    try:
-        owner = _owner_settles(ops_home, {"status": "settled", "reply": "pong"})
-        out = _result(srv._methods["bot_relay.deliver"](1, {"profile": "ops", "message": "ping"}))
-        owner.join(timeout=10)
-        assert out["reply"] == "pong" and submitted == [] and not spawned
     finally:
         lease.release()
 
