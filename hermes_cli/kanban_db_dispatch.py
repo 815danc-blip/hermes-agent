@@ -2180,7 +2180,7 @@ def _tick_spawn_budget(
 def _lane_rows(conn: sqlite3.Connection, status: str) -> list[sqlite3.Row]:
     """Unclaimed rows of one lane in dispatch order."""
     return conn.execute(
-        "SELECT id, assignee FROM tasks "
+        "SELECT id, assignee, execution_scope FROM tasks "
         f"WHERE status = '{status}' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
@@ -2308,9 +2308,61 @@ def _dispatch_once_locked(
     )
     default_assignee = _resolve_default_assignee(default_assignee)
     spawned = 0
+
+    # web_gemini-scope lane: spawned through the Gemini web-conversation worker,
+    # NOT a profile subprocess. Routed before the ready lane so it never hits
+    # the default-assignee fallback (an unassigned web_gemini card is a routing
+    # gap for a human, not something the dispatcher may reassign) nor the
+    # profile-existence guard in ``_dispatch_lane_task`` (``web_gemini`` is a
+    # scope, deliberately not a profile).
+    for row in ready_rows:
+        if spawn_budget is not None and spawned >= spawn_budget:
+            break
+        wg_scope = _kb._task_row_execution_scope(row)
+        if wg_scope != _kb.WEB_GEMINI_EXECUTION_SCOPE:
+            continue
+        row_id = row["id"]
+        if not row["assignee"]:
+            result.skipped_unassigned.append(row_id)
+            continue
+        if dry_run:
+            result.spawned.append((row_id, row["assignee"], ""))
+            spawned += 1
+            continue
+        claimed = _kb.claim_task(conn, row_id, ttl_seconds=ttl_seconds)
+        if claimed is None:
+            continue
+        try:
+            workspace = _kbw.resolve_workspace(claimed, board=board)
+        except Exception as exc:
+            if _record_task_failure(
+                conn, claimed.id, f"workspace: {exc}",
+                outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,
+            ):
+                result.auto_blocked.append(claimed.id)
+            continue
+        _kbw.set_workspace_path(conn, claimed.id, str(workspace))
+        try:
+            pid = _call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board)
+            if pid:
+                _set_worker_pid(conn, claimed.id, int(pid))
+            _kb._fire_worker_spawned_hook(conn, claimed, str(workspace), pid, board=board)
+            result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
+            spawned += 1
+        except Exception as exc:
+            if _record_task_failure(
+                conn, claimed.id, str(exc),
+                outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,
+            ):
+                result.auto_blocked.append(claimed.id)
+
     for row in ready_rows:
         if ready_budget is not None and spawned >= ready_budget:
             break
+        if _kb._task_row_execution_scope(row) == _kb.WEB_GEMINI_EXECUTION_SCOPE:
+            # Owned by the web_gemini lane above (spawned, skipped-unassigned,
+            # or claim-refused) — never the profile-worker path.
+            continue
         row_assignee = row["assignee"]
         if not row_assignee:
             # Honour kanban.default_assignee so an unassigned task doesn't
@@ -2826,7 +2878,11 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     # Intentionally NOT closing log_f: the child keeps writing after return;
     # the OS-level FD stays open in the child until it exits.
     if _kb._IS_WINDOWS:
-        _live_worker_procs[proc.pid] = proc
+        # Duck-type guard: the reaper polls ``.poll()`` on these, so only park
+        # Popen-like handles (a patched-in fake would otherwise poison
+        # ``reap_worker_zombies`` in a later test).
+        if hasattr(proc, "poll"):
+            _live_worker_procs[proc.pid] = proc
     return proc.pid
 
 
