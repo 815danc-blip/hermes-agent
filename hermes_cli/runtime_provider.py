@@ -577,6 +577,27 @@ def _refresh_nous_pool_entry(pool: CredentialPool, entry: Any, pool_api_key: str
     return entry, pool_api_key
 
 
+def _exchange_copilot_pool_entry(entry: Any, pool_api_key: str) -> str:
+    """Exchange a copilot pool entry that still carries the RAW GitHub token.
+
+    The seeder skips the exchange while copilot is merely discovered (ambient gh login, not in
+    config); here copilot IS the runtime target (`/model copilot/… --session`, `--provider copilot`,
+    delegation/cron overrides), and a raw token routes to the language-server integrator whose
+    allowlist omits enterprise-only models (400 model_not_available_for_integrator)."""
+    from hermes_cli.copilot_auth import get_copilot_api_token, validate_copilot_token
+    if not pool_api_key or not validate_copilot_token(pool_api_key)[0]:
+        return pool_api_key  # already an exchanged API token
+    api_token, enterprise_base_url = get_copilot_api_token(pool_api_key)
+    if api_token == pool_api_key and not enterprise_base_url:
+        from agent.credential_pool import _warn_copilot_raw_degradation_once
+        _warn_copilot_raw_degradation_once(pool_api_key)
+        return pool_api_key
+    entry.access_token = api_token
+    if enterprise_base_url:
+        entry.base_url = enterprise_base_url
+    return api_token
+
+
 def _resolve_from_pool(provider: str, requested_provider: str, model_cfg: Dict[str, Any], explicit_api_key, explicit_base_url,
                        target_model) -> Optional[Dict[str, Any]]:
     """Runtime from the provider's credential pool, or None to continue down the ladder."""
@@ -594,6 +615,8 @@ def _resolve_from_pool(provider: str, requested_provider: str, model_cfg: Dict[s
     pool_api_key = _pool_entry_api_key(entry)
     if provider == "nous":
         entry, pool_api_key = _refresh_nous_pool_entry(pool, entry, pool_api_key)
+    elif provider == "copilot":
+        pool_api_key = _exchange_copilot_pool_entry(entry, pool_api_key)
     if pool_api_key and credential_pool_matches_provider(pool, provider, base_url=_pool_entry_base_url(entry)):
         return _resolve_runtime_from_pool_entry(provider=provider, entry=entry, requested_provider=requested_provider,
                                                 model_cfg=model_cfg, pool=pool, target_model=target_model)
