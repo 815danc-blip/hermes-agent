@@ -10,14 +10,6 @@ import pytest
 
 from hermes_cli import kanban_db as kb
 
-# Specs for the 010804 dispatch-config feature (load_dispatch_config,
-# capacity_deferred, per-profile caps): the implementation was deliberately
-# not part of the kanban port. These fail identically on every platform,
-# so this is a feature skip, not a platform skip.
-pytestmark = pytest.mark.skip(
-    reason="010804 dispatch-config feature not ported yet (spec-only; fails on all platforms)"
-)
-
 
 def test_load_dispatch_config_normalizes_all_dispatch_limits():
     config = {
@@ -48,6 +40,8 @@ def test_concurrent_periodic_and_ui_dispatches_respect_both_caps(tmp_path, monke
     home.mkdir()
     for profile in ("default", "research", "ops"):
         (home / "profiles" / profile).mkdir(parents=True)
+        # Identity marker: a bare directory is not a live profile.
+        (home / "profiles" / profile / "config.yaml").write_text("{}\n", encoding="utf-8")
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
@@ -111,6 +105,8 @@ def test_review_dispatch_respects_global_capacity_cap(tmp_path, monkeypatch):
     home.mkdir()
     for profile in ("default", "reviewer"):
         (home / "profiles" / profile).mkdir(parents=True)
+        # Identity marker: a bare directory is not a live profile.
+        (home / "profiles" / profile / "config.yaml").write_text("{}\n", encoding="utf-8")
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
@@ -147,6 +143,8 @@ def _init_capacity_board(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     home.mkdir()
     (home / "profiles" / "default").mkdir(parents=True)
+    # Identity marker: a bare directory is not a live profile.
+    (home / "profiles" / "default" / "config.yaml").write_text("{}\n", encoding="utf-8")
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)

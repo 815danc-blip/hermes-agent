@@ -36,6 +36,15 @@ if TYPE_CHECKING:
 # dispatcher parks the task in ``blocked`` with a reason — prevents retry storms.
 DEFAULT_FAILURE_LIMIT = 2
 
+# Historical alias (010804 era): the dispatcher's failure limit under its
+# pre-decomposition name. Same value, kept for the config contract.
+DEFAULT_SPAWN_FAILURE_LIMIT = DEFAULT_FAILURE_LIMIT
+
+# Default ``max_runtime_seconds`` stamped on tasks created without an explicit
+# value (90 minutes). A task created with ``max_runtime_seconds=None`` stays
+# unbounded; the default applies only to the omitted case.
+DEFAULT_MAX_RUNTIME_SECONDS = 5400
+
 # Worker log files larger than this at spawn time are rotated.
 DEFAULT_LOG_ROTATE_BYTES = 2 * 1024 * 1024   # 2 MiB
 DEFAULT_LOG_BACKUP_COUNT = 1
@@ -81,6 +90,96 @@ _RESPAWN_GUARD_PR_URL_RE = re.compile(
     r"https?://github\.com/[^/\s]+/[^/\s]+/pull/\d+",
     re.IGNORECASE,
 )
+
+
+@dataclass(frozen=True)
+class DispatchConfig:
+    """Normalized limits shared by every Kanban dispatch surface."""
+
+    max_spawn: Optional[int] = None
+    max_in_progress: Optional[int] = None
+    failure_limit: int = DEFAULT_SPAWN_FAILURE_LIMIT
+    stale_timeout_seconds: int = 0
+    default_assignee: Optional[str] = None
+    max_in_progress_per_profile: Optional[int] = None
+    default_max_runtime_seconds: Optional[int] = DEFAULT_MAX_RUNTIME_SECONDS
+
+
+def _optional_positive_int(value: Any) -> Optional[int]:
+    """Return a positive integer config value, or ``None`` when unset/invalid."""
+    if value is None:
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 1 else None
+
+
+def load_dispatch_config(
+    config: Optional[Mapping[str, Any]] = None,
+) -> DispatchConfig:
+    """Load and normalize the limits used by a dispatcher tick.
+
+    ``config`` is accepted so callers that already loaded runtime config (the
+    gateway watcher and CLI) do not read it twice. Dashboard and daemon
+    callers can omit it; the helper then loads the active profile's config.
+    Invalid values fail safe to the historical dispatcher defaults instead of
+    allowing one surface to interpret the same setting differently.
+    """
+    if config is None:
+        try:
+            from hermes_cli.config import load_config
+
+            config = load_config()
+        except Exception:
+            config = {}
+    kanban_cfg = config.get("kanban", {}) if isinstance(config, Mapping) else {}
+    if not isinstance(kanban_cfg, Mapping):
+        kanban_cfg = {}
+
+    try:
+        stale_timeout_seconds = int(
+            kanban_cfg.get("dispatch_stale_timeout_seconds", 0) or 0
+        )
+    except (TypeError, ValueError):
+        stale_timeout_seconds = 0
+    stale_timeout_seconds = max(stale_timeout_seconds, 0)
+
+    raw_default_assignee = kanban_cfg.get("default_assignee")
+    default_assignee = (
+        raw_default_assignee.strip()
+        if isinstance(raw_default_assignee, str)
+        else ""
+    ) or None
+
+    raw_default_runtime = kanban_cfg.get(
+        "default_max_runtime_seconds", DEFAULT_MAX_RUNTIME_SECONDS
+    )
+    if raw_default_runtime is None:
+        default_max_runtime_seconds = None
+    else:
+        default_max_runtime_seconds = (
+            _optional_positive_int(raw_default_runtime)
+            or DEFAULT_MAX_RUNTIME_SECONDS
+        )
+
+    return DispatchConfig(
+        max_spawn=_optional_positive_int(kanban_cfg.get("max_spawn")),
+        max_in_progress=_optional_positive_int(
+            kanban_cfg.get("max_in_progress")
+        ),
+        failure_limit=(
+            _optional_positive_int(kanban_cfg.get("failure_limit"))
+            or DEFAULT_SPAWN_FAILURE_LIMIT
+        ),
+        stale_timeout_seconds=stale_timeout_seconds,
+        default_assignee=default_assignee,
+        max_in_progress_per_profile=_optional_positive_int(
+            kanban_cfg.get("max_in_progress_per_profile")
+        ),
+        default_max_runtime_seconds=default_max_runtime_seconds,
+    )
 
 
 @dataclass
@@ -147,6 +246,12 @@ class DispatchResult:
     """Memory pressure that restricted this tick: ``"critical"`` (no new
     workers), ``"elevated"`` (at most one), ``None`` (no restriction).
     Reclaim/promotion bookkeeping still ran; deferred tasks stay queued."""
+    capacity_deferred: bool = False
+    """True when a spawnable task was withheld by a capacity cap
+    (``max_spawn`` / ``max_in_progress``) or the per-profile cap — i.e. the
+    board has work it *could* run once capacity frees up. Deliberately not
+    set for unassigned / nonspawnable / respawn-guarded skips: those need an
+    operator or a guard window, not capacity."""
 
 
 def describe_suppression(results: Iterable[Optional["DispatchResult"]]) -> str:
@@ -2169,10 +2274,17 @@ def _dispatch_lane_task(
     spawn_fn,
     per_profile_cap: Optional[int],
     per_profile_running: dict[str, int],
+    spawn_budget: Optional[int] = None,
+    spawned_count: int = 0,
 ) -> bool:
     """Guard, claim, resolve the workspace and spawn one ready/review row.
     Returns True when a spawn slot was consumed (real or ``dry_run``); every
     skip is recorded on ``result``.
+
+    ``spawn_budget``/``spawned_count`` carry the shared tick budget (010804):
+    the gate is evaluated per *spawnable* row — after the respawn guard, so a
+    guarded task reports its guard reason rather than a generic capacity hold
+    — and set ``capacity_deferred`` when a spawnable task is withheld.
     """
     task_id = row["id"]
     # Non-profile assignees (control-plane lanes that pull via ``claim_task``)
@@ -2183,27 +2295,33 @@ def _dispatch_lane_task(
     if profile_exists is not None and not profile_exists(assignee):
         result.skipped_nonspawnable.append(task_id)
         return False
-    # Per-profile cap: one profile's local model / API quota / browser pool
-    # must not be overwhelmed by a fan-out even with global headroom.
-    if per_profile_cap is not None:
-        current = per_profile_running.get(assignee, 0)
-        if current >= per_profile_cap:
-            result.skipped_per_profile_capped.append((task_id, assignee, current))
-            return False
+    # Respawn guard BEFORE the per-profile cap (010804): an auth/quota-blocked
+    # task must surface its real guard reason instead of a generic "profile
+    # busy", and a guarded task is deferred by the guard — not by capacity —
+    # so it must not set ``capacity_deferred``.
     guard_reason = check_respawn_guard(conn, task_id, lane=lane)
     if guard_reason is not None:
         result.respawn_guarded.append((task_id, guard_reason))
         # Event so ``hermes kanban tail`` shows why the task looks stuck.
-        # Honour kanban.default_assignee: when the dispatcher hits an unassigned ready task and an
-        # operator-configured fallback exists, persist the assignment and proceed. This removes the
-        # dashboard footgun where a task created without an assignee parks in 'ready' forever even though
-        # the operator's intent ("default") was perfectly clear (#27145). Mutating the row (not just the
-        # in-memory view) keeps diagnostics and the board state consistent: the task is now legitimately
-        # owned by ``kanban.default_assignee``, not "unassigned but secretly routed".
         if not dry_run:
             with _kb.write_txn(conn):
                 _kb._append_event(conn, task_id, "respawn_guarded", {"reason": guard_reason})
         return False
+    # Global capacity gate (010804): a spawnable task withheld by
+    # ``max_spawn`` / ``max_in_progress`` defers the tick. Unassigned /
+    # nonspawnable / guarded rows above are not capacity — they never set it.
+    if spawn_budget is not None and spawned_count >= spawn_budget:
+        result.capacity_deferred = True
+        return False
+    # Per-profile cap: one profile's local model / API quota / browser pool
+    # must not be overwhelmed by a fan-out even with global headroom. This is
+    # a capacity hold, not an operator-actionable skip, so it defers.
+    if per_profile_cap is not None:
+        current = per_profile_running.get(assignee, 0)
+        if current >= per_profile_cap:
+            result.capacity_deferred = True
+            result.skipped_per_profile_capped.append((task_id, assignee, current))
+            return False
 
     def _count_spawn(name: str) -> None:
         # Later rows in this tick respect the per-profile cap; subsequent
@@ -2349,7 +2467,10 @@ def _tick_spawn_budget(
     if max_spawn is not None or max_in_progress is not None:
         running_count = count_running_tasks(conn)
 
-    # Both ready and review loops consume from the same budget.
+    # Both ready and review loops consume from the same budget. A cap hit at
+    # the tick level does NOT set ``capacity_deferred`` here: whether that is
+    # a capacity hold depends on whether a *spawnable* row exists, which the
+    # per-row gate in :func:`_dispatch_lane_task` knows and this helper cannot.
     if max_spawn is not None:
         if running_count >= max_spawn:
             return False, None
@@ -2473,8 +2594,16 @@ def _dispatch_once_locked(
     may_spawn, spawn_budget = _tick_spawn_budget(
         conn, result, max_spawn=max_spawn, max_in_progress=max_in_progress, board=board,
     )
-    if not may_spawn:
+    if result.memory_pressure == "critical":
+        # Memory pressure is a host emergency, not board capacity: record the
+        # hold and stop before any lane work (tasks stay queued).
         return result
+    if not may_spawn:
+        # Capacity exhausted (max_spawn / max_in_progress). The lanes still
+        # run so per-row skips are recorded and a genuinely spawnable row
+        # surfaces as ``capacity_deferred`` (010804); the per-row gate inside
+        # :func:`_dispatch_lane_task` refuses every spawn.
+        spawn_budget = 0
 
     ready_rows = _lane_rows(conn, "ready")
     # Review rows are enumerated up front so the budget split can see whether
@@ -2503,7 +2632,9 @@ def _dispatch_once_locked(
     # Review-lane reservation: the ready loop runs first and would otherwise
     # consume the ENTIRE shared budget, starving reviews under a sustained ready
     # backlog. When spawnable review work exists and there is any budget, hold
-    # one slot back.
+    # one slot back. The withheld ready rows still flow through the per-row
+    # gate (profile + respawn guard), so a genuinely spawnable one surfaces as
+    # ``capacity_deferred`` instead of vanishing silently (010804).
     ready_budget = spawn_budget
     if spawn_budget is not None and spawn_budget > 0 and _any_spawnable_review(
         conn, review_rows,
@@ -2525,14 +2656,16 @@ def _dispatch_once_locked(
     # profile-existence guard in ``_dispatch_lane_task`` (``web_gemini`` is a
     # scope, deliberately not a profile).
     for row in ready_rows:
-        if spawn_budget is not None and spawned >= spawn_budget:
-            break
         wg_scope = _kb._task_row_execution_scope(row)
         if wg_scope != _kb.WEB_GEMINI_EXECUTION_SCOPE:
             continue
         row_id = row["id"]
         if not row["assignee"]:
             result.skipped_unassigned.append(row_id)
+            continue
+        if spawn_budget is not None and spawned >= spawn_budget:
+            # A spawnable web_gemini row withheld by capacity defers the tick.
+            result.capacity_deferred = True
             continue
         if dry_run:
             result.spawned.append((row_id, row["assignee"], ""))
@@ -2566,8 +2699,6 @@ def _dispatch_once_locked(
                 result.auto_blocked.append(claimed.id)
 
     for row in ready_rows:
-        if ready_budget is not None and spawned >= ready_budget:
-            break
         if _kb._task_row_execution_scope(row) == _kb.WEB_GEMINI_EXECUTION_SCOPE:
             # Owned by the web_gemini lane above (spawned, skipped-unassigned,
             # or claim-refused) — never the profile-worker path.
@@ -2583,7 +2714,8 @@ def _dispatch_once_locked(
                 continue
             row_assignee = default_assignee
             result.auto_assigned_default.append(row["id"])
-        if _dispatch_lane_task(conn, row, row_assignee, result, lane="ready", **lane_kwargs):
+        if _dispatch_lane_task(conn, row, row_assignee, result, lane="ready",
+                               spawn_budget=ready_budget, spawned_count=spawned, **lane_kwargs):
             spawned += 1
 
     # A review agent (sdlc-review) approves (→ done) or requests changes
@@ -2591,12 +2723,11 @@ def _dispatch_once_locked(
     # checks the FULL shared ``spawn_budget`` — the reservation above caps the
     # ready lane, it grants no extra capacity here.
     for row in review_rows:
-        if spawn_budget is not None and spawned >= spawn_budget:
-            break
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])
             continue
-        if _dispatch_lane_task(conn, row, row["assignee"], result, lane="review", **lane_kwargs):
+        if _dispatch_lane_task(conn, row, row["assignee"], result, lane="review",
+                               spawn_budget=spawn_budget, spawned_count=spawned, **lane_kwargs):
             spawned += 1
     return result
 

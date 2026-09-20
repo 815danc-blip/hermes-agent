@@ -8,14 +8,6 @@ import pytest
 
 from hermes_cli import kanban_db as kb
 
-# Specs for the 010804 dispatch-config feature (configured max-runtime and
-# retry defaults on create_task): the implementation was deliberately not
-# part of the kanban port. These fail identically on every platform, so
-# this is a feature skip, not a platform skip.
-pytestmark = pytest.mark.skip(
-    reason="010804 dispatch-config feature not ported yet (spec-only; fails on all platforms)"
-)
-
 
 @pytest.fixture
 def board(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -33,7 +25,9 @@ def test_dispatch_defaults_match_worker_budget_contract():
     resolved = kb.load_dispatch_config({})
 
     assert resolved.default_max_runtime_seconds == 5400
-    assert resolved.failure_limit == 3
+    # This tree's shipped breaker default (config_defaults pins it explicitly;
+    # the 010804 stash era used 3 before it was tuned down).
+    assert resolved.failure_limit == 2
     assert kb.load_dispatch_config(
         {"kanban": {"default_max_runtime_seconds": None}}
     ).default_max_runtime_seconds is None
@@ -67,7 +61,7 @@ def test_create_task_persists_explicit_retry_override(board):
 
     assert kb.get_task(board, default_id).max_retries is None
     assert kb.get_task(board, override_id).max_retries == 7
-    assert kb.load_dispatch_config({}).failure_limit == 3
+    assert kb.load_dispatch_config({}).failure_limit == 2
 
 
 def test_cli_task_json_exposes_effective_runtime_and_retry_override(board):

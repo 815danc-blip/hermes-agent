@@ -1752,13 +1752,20 @@ def _validate_execution_scope_column(execution_scope: Optional[str]) -> Optional
     return scope
 
 
+# Sentinel for create_task's ``max_runtime_seconds``: only the genuinely-omitted
+# case resolves ``kanban.default_max_runtime_seconds``; an explicit ``None``
+# stays unbounded (preserves the historical "no cap" behavior for callers).
+_UNSET_MAX_RUNTIME_SECONDS: Any = object()
+
+
 def create_task(
     conn: sqlite3.Connection, *, title: str, body: Optional[str] = None,
     assignee: Optional[str] = None, created_by: Optional[str] = None,
     workspace_kind: Optional[str] = None, workspace_path: Optional[str] = None,
     branch_name: Optional[str] = None, tenant: Optional[str] = None, priority: int = 0,
     parents: Iterable[str] = (), triage: bool = False, idempotency_key: Optional[str] = None,
-    max_runtime_seconds: Optional[int] = None, skills: Optional[Iterable[str]] = None,
+    max_runtime_seconds: Optional[int] = _UNSET_MAX_RUNTIME_SECONDS,
+    skills: Optional[Iterable[str]] = None,
     max_retries: Optional[int] = None, model_override: Optional[str] = None,
     provider_override: Optional[str] = None, reasoning_effort: Optional[str] = None,
     goal_mode: bool = False, goal_max_turns: Optional[int] = None, initial_status: str = "running",
@@ -1777,7 +1784,9 @@ def create_task(
     forces ``triage``; ``initial_status="blocked"`` parks it for human ops.
     ``idempotency_key``: an existing non-archived task with the key is returned
     instead of a duplicate. ``max_runtime_seconds``: cap before the dispatcher
-    SIGTERMs and re-queues. ``model_override``/``provider_override`` pin the
+    SIGTERMs and re-queues. Omitted, it resolves the active profile's
+    ``kanban.default_max_runtime_seconds`` (5400s by default); an explicit
+    ``None`` stays unbounded. ``model_override``/``provider_override`` pin the
     worker model (provider requires model); ``reasoning_effort`` is independent.
     ``creator_task_id``: inherit durable session/subscriptions independently of
     dependency edges; an explicit ``session_id`` still wins.
@@ -1858,6 +1867,12 @@ def create_task(
         ).fetchone()
         if row:
             return row["id"]
+
+    # Resolve the runtime default only for a genuinely new row: idempotent
+    # lookups and existing tasks keep their original value, and an explicit
+    # ``None`` preserves the historical unbounded behavior.
+    if max_runtime_seconds is _UNSET_MAX_RUNTIME_SECONDS:
+        max_runtime_seconds = load_dispatch_config().default_max_runtime_seconds
 
     now = int(time.time())
 
@@ -4906,6 +4921,12 @@ from hermes_cli.kanban_db_dispatch import (  # noqa: E402
     _worker_terminal_timeout_env,
     worker_log_rotation_config,
 )
+from hermes_cli.kanban_db_dispatch import (  # noqa: F401,E402
+    DEFAULT_MAX_RUNTIME_SECONDS,
+    DispatchConfig,
+    load_dispatch_config,
+)
+from hermes_cli.kanban_db_graph import decompose_triage_task  # noqa: F401,E402
 from hermes_cli.kanban_worker_process import spawn_worker_process  # noqa: E402
 
 
@@ -4961,6 +4982,8 @@ _PLUGIN_COMPAT_LAZY = {
     'detect_crashed_workers': ('hermes_cli.kanban_db_dispatch', 'detect_crashed_workers'),
     'detect_stale_running': ('hermes_cli.kanban_db_dispatch', 'detect_stale_running'),
     'dispatch_once': ('hermes_cli.kanban_db_dispatch', 'dispatch_once'),
+    'DispatchConfig': ('hermes_cli.kanban_db_dispatch', 'DispatchConfig'),
+    'load_dispatch_config': ('hermes_cli.kanban_db_dispatch', 'load_dispatch_config'),
     'enforce_max_runtime': ('hermes_cli.kanban_db_dispatch', 'enforce_max_runtime'),
     'has_spawnable_ready': ('hermes_cli.kanban_db_dispatch', 'has_spawnable_ready'),
     'has_spawnable_review': ('hermes_cli.kanban_db_dispatch', 'has_spawnable_review'),
