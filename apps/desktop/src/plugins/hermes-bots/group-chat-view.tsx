@@ -72,6 +72,7 @@ import type { GroupChatRoom } from './group-chat'
 import { GroupClarifyCard, GroupImageControls, GroupMentionInput } from './group-chat-parts'
 import type { GroupRoomPrompt } from './group-chat-parts'
 import { GroupMemberPicker } from './group-chat-view-members'
+import { sweepExternalGroupWrites } from './group-external-writes'
 import { GroupHoldStatus } from './group-hold-status'
 import {
   botGroups,
@@ -1408,6 +1409,10 @@ export function openGroupChat(group: string): void {
   })
   const ownerKey = groupWorkspaceOwnerKey(group)
   setBotsWorkspaceOwner(ownerKey, null, 'New group conversations start in the group composer.')
+  // #93813: what reached the members' room sessions while nobody drove them
+  // (a Bot posting reports into its own session, a CLI resume) is posted as
+  // the room opens, not only once the room next drives that member.
+  void sweepExternalGroupWrites(group, groupChatMemberBots(group, $lastRoster.get(), $botMeta.get()))
 
   if (typeof host.openWorkspace === 'function') {
     try {
