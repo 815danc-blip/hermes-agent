@@ -1343,6 +1343,25 @@ def _classify_dead_worker_with_envelope(
     event_kind, event_payload, protocol_violation, operational, rate_limited = _envelope_booking(
         envelope, cause or f"worker reported {getattr(envelope.failure_class, 'value', '')}"
     )
+    # Typed run outcome: the receipt's failure class is stronger causal
+    # evidence than a generic crash label. Operational classes book the
+    # class itself (``provider_transport`` etc.); ``success`` without a
+    # terminal kanban call is a ``worker_protocol`` violation; unknown
+    # keeps ``worker_exit_unknown``; task-logic crashes stay ``crashed``.
+    from hermes_cli.kanban_worker_outcomes import FailureClass as _FC
+    if envelope.failure_class in {
+        _FC.PROVIDER_CAPACITY, _FC.PROVIDER_TRANSPORT, _FC.PROVIDER_AUTH,
+        _FC.CONTEXT_LIMIT, _FC.TOOL_UNAVAILABLE, _FC.WORKSPACE_PROVISIONING,
+    }:
+        run_outcome = envelope.failure_class.value
+    elif envelope.failure_class is _FC.WORKER_PROTOCOL:
+        run_outcome = _FC.WORKER_PROTOCOL.value
+    elif envelope.failure_class is _FC.WORKER_EXIT_UNKNOWN:
+        run_outcome = _FC.WORKER_EXIT_UNKNOWN.value
+    elif envelope.failure_class is _FC.SUCCESS:
+        run_outcome = _FC.WORKER_PROTOCOL.value
+    else:
+        run_outcome = "crashed"
     error_text = str(event_payload.get("error") or event_payload.get("real_cause") or cause or "")
     if envelope.failure_class is _WorkerFailureClass.SUCCESS:
         error_text = _CLEAN_EXIT_PROTOCOL_VIOLATION_TEXT
@@ -1358,6 +1377,7 @@ def _classify_dead_worker_with_envelope(
         "protocol_violation": protocol_violation,
         "operational": operational,
         "rate_limited": rate_limited,
+        "run_outcome": run_outcome,
     }
 
 
@@ -2955,8 +2975,9 @@ def release_stale_claims(
     reclaimed = 0
     host_prefix = _host_prefix()
     stale = conn.execute(
-        "SELECT id, claim_lock, worker_pid, worker_started_at, claim_expires, last_heartbeat_at, "
-        "       assignee "
+        "SELECT id, claim_lock, worker_pid, worker_started_at, worker_start_time, "
+        "       worker_owner_kind, worker_owner_id, worker_exit_envelope, "
+        "       claim_expires, last_heartbeat_at, assignee "
         "FROM tasks "
         "WHERE status = 'running' AND claim_expires IS NOT NULL "
         "  AND claim_expires < ?", (now,),
@@ -2975,6 +2996,10 @@ def release_stale_claims(
 
         termination = _terminate_reclaimed_worker(
             row["worker_pid"], row["claim_lock"], signal_fn=signal_fn, started_at=started_at,
+            worker_start_time=_row_get(row, "worker_start_time"),
+            worker_owner_kind=_row_get(row, "worker_owner_kind"),
+            worker_owner_id=_row_get(row, "worker_owner_id"),
+            worker_exit_envelope=_row_get(row, "worker_exit_envelope"),
         )
         # A live worker of ours must keep its claim (else a duplicate spawns beside it).
         if _worker_survived_termination(termination):
@@ -2987,7 +3012,9 @@ def release_stale_claims(
             retry_status = _retry_status_for_run(conn, row["id"])
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
-                "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL "
+                "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
+                "worker_start_time = NULL, worker_owner_kind = NULL, "
+                "worker_owner_id = NULL, worker_exit_envelope = NULL "
                 "WHERE id = ? AND status = 'running' AND claim_lock IS ? "
                 "AND claim_expires IS NOT NULL AND claim_expires < ?",
                 (retry_status, row["id"], row["claim_lock"], now),
@@ -3077,7 +3104,9 @@ def reclaim_task(
     """Operator reclaim regardless of TTL: release the claim, restore the source
     phase, reset the failure counter. False when not running."""
     row = conn.execute(
-        "SELECT status, claim_lock, worker_pid, worker_started_at FROM tasks WHERE id = ?", (task_id,),
+        "SELECT status, claim_lock, worker_pid, worker_started_at, worker_start_time, "
+        "       worker_owner_kind, worker_owner_id, worker_exit_envelope "
+        "FROM tasks WHERE id = ?", (task_id,),
     ).fetchone()
     if not row:
         return False
@@ -3086,12 +3115,34 @@ def reclaim_task(
         return False
     prev_lock = row["claim_lock"]
     termination = _terminate_reclaimed_worker(
-        row["worker_pid"], prev_lock, signal_fn=signal_fn, started_at=row["worker_started_at"])
+        row["worker_pid"], prev_lock, signal_fn=signal_fn, started_at=row["worker_started_at"],
+        worker_start_time=_row_get(row, "worker_start_time"),
+        worker_owner_kind=_row_get(row, "worker_owner_kind"),
+        worker_owner_id=_row_get(row, "worker_owner_id"),
+        worker_exit_envelope=_row_get(row, "worker_exit_envelope"),
+    )
+    # Never release a claim while an owned worker tree may still be alive:
+    # the next dispatch tick retries the cleanup instead of spawning a
+    # duplicate beside the surviving tree. Rows without ownership identity
+    # (fingerprint-only) keep the human-override release — the operator may
+    # be reclaiming a wedged spawn that no registry can vouch for.
+    ownership_aware = (
+        _row_get(row, "worker_start_time") is not None
+        or bool(_row_get(row, "worker_owner_kind") and _row_get(row, "worker_owner_id"))
+    )
+    if ownership_aware and _worker_survived_termination(termination):
+        _defer_reclaim_for_live_worker(
+            conn, task_id, prev_lock, int(time.time()), termination,
+            reason="manual_reclaim_worker_alive",
+        )
+        return False
     with write_txn(conn):
         retry_status = _retry_status_for_run(conn, task_id)
         cur = conn.execute(
             "UPDATE tasks SET status = ?, claim_lock = NULL, "
-            "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL "
+            "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
+            "worker_start_time = NULL, worker_owner_kind = NULL, "
+            "worker_owner_id = NULL, worker_exit_envelope = NULL "
             "WHERE id = ? AND status IN ('running', 'ready', 'blocked') "
             "AND claim_lock IS ?", (retry_status, task_id, prev_lock),
         )
@@ -4929,6 +4980,8 @@ _PLUGIN_COMPAT_LAZY = {
     'set_workspace_path': ('hermes_cli.kanban_db_workspace', 'set_workspace_path'),
     'unseen_events_for_sub': ('hermes_cli.kanban_db_notify', 'unseen_events_for_sub'),
     'worker_log_rotation_config': ('hermes_cli.kanban_db_dispatch', 'worker_log_rotation_config'),
+    '_set_worker_pid': ('hermes_cli.kanban_db_dispatch', '_set_worker_pid'),
+    'cleanup_worker_tree': ('hermes_cli.kanban_worker_process', 'cleanup_worker_tree'),
 }
 
 
@@ -5013,6 +5066,10 @@ def _detect_crashed_workers_impl(
                 # worker that survives the signal holds its claim (no dupes).
                 termination = _terminate_reclaimed_worker(
                     pid, row["claim_lock"], started_at=_row_get(row, "worker_started_at"),
+                    worker_start_time=_row_get(row, "worker_start_time"),
+                    worker_owner_kind=_row_get(row, "worker_owner_kind"),
+                    worker_owner_id=_row_get(row, "worker_owner_id"),
+                    worker_exit_envelope=_row_get(row, "worker_exit_envelope"),
                 )
                 if _worker_survived_termination(termination):
                     deferred_reclaims.append(
@@ -5031,6 +5088,10 @@ def _detect_crashed_workers_impl(
                     continue
                 termination = _terminate_reclaimed_worker(
                     pid, row["claim_lock"], started_at=_row_get(row, "worker_started_at"),
+                    worker_start_time=_row_get(row, "worker_start_time"),
+                    worker_owner_kind=_row_get(row, "worker_owner_kind"),
+                    worker_owner_id=_row_get(row, "worker_owner_id"),
+                    worker_exit_envelope=_row_get(row, "worker_exit_envelope"),
                 )
                 if _worker_survived_termination(termination):
                     deferred_reclaims.append(
@@ -5047,6 +5108,7 @@ def _detect_crashed_workers_impl(
                         "protocol_violation": False,
                         "operational": False,
                         "rate_limited": False,
+                        "run_outcome": "crashed",
                     }
                 elif kind == "clean_exit":
                     dead = {
@@ -5059,6 +5121,7 @@ def _detect_crashed_workers_impl(
                         },
                         "protocol_violation": True,
                         "operational": False, "rate_limited": False,
+                        "run_outcome": "worker_protocol",
                     }
                 elif kind == "rate_limited":
                     dead = {
@@ -5096,9 +5159,14 @@ def _detect_crashed_workers_impl(
                         },
                         "protocol_violation": False,
                         "operational": False, "rate_limited": False,
+                        "run_outcome": "worker_exit_unknown",
                     }
 
             event_payload = dict(dead["event_payload"])
+            # Merge the termination receipt so the audit trail shows exactly
+            # how the owned tree was cleaned up (identity proof, graceful vs
+            # forced signal, tree coverage) — same shape as ``release_stale_claims``.
+            event_payload.update(termination)
             event_payload["retry_status"] = _retry_status_for_run(conn, row["id"])
             cur = conn.execute(
                 "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
@@ -5112,13 +5180,16 @@ def _detect_crashed_workers_impl(
             )
             if cur.rowcount != 1:
                 continue
-            # Run-outcome label follows main's reaper contract: ``rate_limited``
-            # for quota walls (a phantom crash would misread board history);
-            # everything else records ``crashed`` — budget semantics live in
-            # consecutive_failures / last_failure_error, not the label.
-            run_outcome = (
-                "rate_limited" if dead.get("rate_limited") else "crashed"
-            )
+            # Run-outcome label: envelope receipts carry typed causal
+            # classes (``provider_transport``, ``worker_protocol``, ...) —
+            # use them; quota walls stay ``rate_limited`` (a phantom crash
+            # would misread board history); everything else is ``crashed``.
+            # Budget semantics live in consecutive_failures /
+            # last_failure_error, not the label.
+            if dead.get("rate_limited"):
+                run_outcome = "rate_limited"
+            else:
+                run_outcome = dead.get("run_outcome") or "crashed"
             run_id = _end_run(
                 conn, row["id"],
                 outcome=run_outcome, status=run_outcome,

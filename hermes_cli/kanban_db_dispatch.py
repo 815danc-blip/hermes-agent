@@ -26,6 +26,7 @@ from typing import Optional
 from typing import TYPE_CHECKING
 
 from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
+from hermes_cli.kanban_worker_process import cleanup_worker_tree, get_worker_receipt
 
 if TYPE_CHECKING:
     from hermes_cli.kanban_db import Task
@@ -438,19 +439,44 @@ def _terminate_reclaimed_worker(
     *,
     signal_fn=None,
     started_at=None,
+    worker_start_time=None,
+    worker_owner_kind=None,
+    worker_owner_id=None,
+    worker_exit_envelope=None,
 ) -> dict[str, Any]:
-    """Best-effort host-local worker termination for reclaim paths. ``started_at`` is the spawn-time
-    fingerprint: when the live process no longer matches it, the PID was recycled and nothing is
-    signalled — the worker is gone, which is what the reclaim wanted (``terminated`` = True). An
-    UNVERIFIED spawn (fingerprint capture failed) that is still live is never signalled either, but
-    it is reported as surviving (``signal_refused``) so the reclaim holds the claim instead of
-    spawning a duplicate beside it."""
+    """Best-effort host-local worker termination for reclaim paths.
+
+    Workers spawned through ``spawn_worker_process`` carry registry-derived
+    ownership identity (creation-time ``worker_start_time``, ``(owner_kind,
+    owner_id)`` cleanup handle, ``worker_exit_envelope`` receipt path). For
+    those the kill routes through ``cleanup_worker_tree``: graceful stop, then
+    force-reap of the whole owned tree (Windows Job Object / POSIX process
+    group), never a bare-PID signal. A live PID whose creation fingerprint no
+    longer matches is treated as recycled and never signalled.
+
+    Legacy rows (fingerprint only) keep the single-process kill path:
+    ``started_at`` is the spawn-time fingerprint — when the live process no
+    longer matches it, the PID was recycled and nothing is signalled — the
+    worker is gone, which is what the reclaim wanted (``terminated`` = True).
+    An UNVERIFIED spawn (fingerprint capture failed) that is still live is
+    never signalled either; it is reported as surviving (``signal_refused``)
+    so the reclaim holds the claim instead of spawning a duplicate beside it.
+
+    ``signal_fn`` remains a compatibility/test hook for callers that model a
+    worker without a real subprocess. It is never used by the production
+    dispatcher."""
     info: dict[str, Any] = {
         "prev_pid": int(pid) if pid else None,
         "host_local": False,
         "termination_attempted": False,
         "terminated": False,
         "sigkill": False,
+        "identity_verified": False,
+        "pid_reused": False,
+        "graceful_cleanup": False,
+        "forced_cleanup": False,
+        "tree_cleanup": False,
+        "unsafe_to_reclaim": False,
     }
     if not pid or pid <= 0 or not claim_lock:
         return info
@@ -458,9 +484,126 @@ def _terminate_reclaimed_worker(
         return info
     info["host_local"] = True
 
+    # Preserve the old injectable path for unit tests and non-subprocess
+    # integrations. It is never used by the production dispatcher.
+    if signal_fn is not None:
+        kill = _kill_fn(signal_fn)
+        if kill is None:
+            return info
+        if started_at == UNVERIFIED_WORKER_FINGERPRINT:
+            # Never signal by bare number: a dead PID is "gone" (reclaim proceeds), a live one is held.
+            info["signal_refused"] = True
+            info["terminated"] = not _kb._pid_alive(pid)
+            return info
+        if _pid_recycled(pid, started_at):
+            info["terminated"] = True
+            info["pid_recycled"] = True
+            return info
+
+        info["termination_attempted"] = True
+        try:
+            kill(int(pid), signal.SIGTERM)
+        except ProcessLookupError:
+            # Already gone = successful termination. Leaving terminated=False would
+            # make the reclaim guard misread a dead worker as alive and defer forever.
+            info["terminated"] = True
+            return info
+        except OSError:
+            return info
+
+        if _poll_worker_exit(pid, started_at):
+            info["terminated"] = True
+            return info
+        if _worker_alive(pid, started_at):
+            if not _sigkill(kill, pid):
+                return info
+            info["sigkill"] = True
+        info["terminated"] = not _worker_alive(pid, started_at)
+        return info
+
+    # Ownership-aware path: the row carries stamped spawn identity, so the
+    # kill must cover the whole owned tree, not just the root PID. Releasing
+    # a claim while any owned descendant survives would overlap a retry with
+    # the old tree — the duplication incident this path exists to prevent.
+    if worker_start_time is not None or (worker_owner_kind and worker_owner_id):
+        # Resolved through the kb facade so ``kb.cleanup_worker_tree`` test
+        # patches (the pre-decomposition monkeypatch surface) bind.
+        cleanup = _kb.cleanup_worker_tree(
+            int(pid),
+            start_time=(int(worker_start_time) if worker_start_time is not None else None),
+            owner_kind=worker_owner_kind,
+            owner_id=worker_owner_id,
+            envelope_path=worker_exit_envelope,
+            reason="dispatcher_reclaim",
+        )
+        tree_gone = bool(cleanup.get("tree_cleanup"))
+        info.update({
+            "identity_verified": bool(cleanup.get("identity_verified")),
+            "pid_reused": bool(cleanup.get("pid_reused")),
+            "graceful_cleanup": bool(cleanup.get("graceful_cleanup")),
+            "forced_cleanup": bool(cleanup.get("forced_cleanup")),
+            "tree_cleanup": tree_gone,
+            "terminated": tree_gone,
+            "termination_attempted": bool(
+                cleanup.get("graceful_action") or cleanup.get("forced_action")
+            ),
+            "unsafe_to_reclaim": bool(
+                cleanup.get("survived_cleanup") and not tree_gone
+            ),
+            "survived_cleanup": bool(cleanup.get("survived_cleanup")),
+            "graceful_action": cleanup.get("graceful_action"),
+            "forced_action": cleanup.get("forced_action"),
+            "already_absent": bool(cleanup.get("already_absent")),
+        })
+        if not tree_gone:
+            # No proof the owned tree is gone: hold the claim (fail closed)
+            # so the next dispatch tick retries the cleanup instead of
+            # spawning a duplicate beside a surviving descendant.
+            info["termination_attempted"] = True
+            info["terminated"] = False
+        info["sigkill"] = bool(cleanup.get("forced_cleanup"))
+        return info
+
     kill = _kill_fn(signal_fn)
     if kill is None:
         return info
+    if started_at == UNVERIFIED_WORKER_FINGERPRINT:
+        # Never signal by bare number: a dead PID is "gone" (reclaim proceeds), a live one is held.
+        info["signal_refused"] = True
+        info["terminated"] = not _kb._pid_alive(pid)
+        return info
+    if not _kb._pid_alive(pid):
+        # Already gone: nothing to signal. On Windows ``os.kill`` against a
+        # dead PID raises a plain OSError (winerror 87), not
+        # ProcessLookupError, so without this short-circuit a crashed worker
+        # was reported as "survived" and its claim deferred forever.
+        info["terminated"] = True
+        return info
+    if _pid_recycled(pid, started_at):
+        info["terminated"] = True
+        info["pid_recycled"] = True
+        return info
+
+    info["termination_attempted"] = True
+    try:
+        kill(int(pid), signal.SIGTERM)
+    except ProcessLookupError:
+        # Already gone = successful termination. Leaving terminated=False would
+        # make the reclaim guard misread a dead worker as alive and defer forever.
+        info["terminated"] = True
+        return info
+    except OSError:
+        return info
+
+    if _poll_worker_exit(pid, started_at):
+        info["terminated"] = True
+        return info
+    if _worker_alive(pid, started_at):
+        if not _sigkill(kill, pid):
+            return info
+        info["sigkill"] = True
+    info["terminated"] = not _worker_alive(pid, started_at)
+    return info
     if started_at == UNVERIFIED_WORKER_FINGERPRINT:
         # Never signal by bare number: a dead PID is "gone" (reclaim proceeds), a live one is held.
         info["signal_refused"] = True
@@ -657,7 +800,8 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
     host_prefix = _kb._host_prefix()
 
     rows = conn.execute(
-        "SELECT t.id, t.worker_pid, t.worker_started_at, "
+        "SELECT t.id, t.worker_pid, t.worker_started_at, t.worker_start_time, "
+        "       t.worker_owner_kind, t.worker_owner_id, t.worker_exit_envelope, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at, "
         "       t.max_runtime_seconds, t.claim_lock "
         "FROM tasks t "
@@ -680,24 +824,48 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
         pid = int(row["worker_pid"])
         tid = row["id"]
         started_at = _kb._row_get(row, "worker_started_at")
-        if started_at == UNVERIFIED_WORKER_FINGERPRINT and _kb._pid_alive(pid):
+        worker_start_time = _kb._row_get(row, "worker_start_time")
+        worker_owner_kind = _kb._row_get(row, "worker_owner_kind")
+        worker_owner_id = _kb._row_get(row, "worker_owner_id")
+        if (worker_start_time is None and not (worker_owner_kind and worker_owner_id)
+                and started_at == UNVERIFIED_WORKER_FINGERPRINT and _kb._pid_alive(pid)):
             # Fingerprint capture failed at spawn: we cannot prove this live PID is our worker, so
             # it is neither signalled nor released beside (duplicate). It is reclaimed once it exits.
             _kb._log.warning("kanban: task %s worker pid %s exceeded max runtime but has no verified "
                              "identity; not signalled", tid, pid)
             continue
-        # SIGTERM then SIGKILL after 5 s grace; workers wanting a cleaner
-        # shutdown install their own SIGTERM handler. A recycled PID (fingerprint
-        # mismatch) is never signalled: the worker is already gone.
+        # Ownership-aware rows (registry-stamped identity) take the tree-kill
+        # path through ``_terminate_reclaimed_worker``: graceful stop, then
+        # force-reap of the whole owned tree. A surviving tree holds the claim
+        # so no retry overlaps the old workers. Legacy rows keep the bare-PID
+        # SIGTERM/SIGKILL path; a recycled PID is never signalled.
+        owned = worker_start_time is not None or bool(worker_owner_kind and worker_owner_id)
+        termination: Optional[dict] = None
         killed = False
-        kill = _kill_fn(signal_fn)
-        if kill is not None and not (_kb._pid_alive(pid) and _pid_recycled(pid, started_at)):
-            with contextlib.suppress(ProcessLookupError, OSError):
-                kill(pid, signal.SIGTERM)
-            # Short polling wait — no time.sleep on the write txn.
-            _poll_worker_exit(pid, started_at)
-            if _worker_alive(pid, started_at):
-                killed = _sigkill(kill, pid)
+        if owned:
+            termination = _terminate_reclaimed_worker(
+                pid, row["claim_lock"],
+                worker_start_time=worker_start_time,
+                worker_owner_kind=worker_owner_kind,
+                worker_owner_id=worker_owner_id,
+                worker_exit_envelope=_kb._row_get(row, "worker_exit_envelope"),
+            )
+            if _worker_survived_termination(termination):
+                _defer_reclaim_for_live_worker(
+                    conn, tid, row["claim_lock"], now, termination,
+                    reason="max_runtime_worker_alive",
+                )
+                continue
+            killed = bool(termination.get("forced_cleanup"))
+        else:
+            kill = _kill_fn(signal_fn)
+            if kill is not None and not (_kb._pid_alive(pid) and _pid_recycled(pid, started_at)):
+                with contextlib.suppress(ProcessLookupError, OSError):
+                    kill(pid, signal.SIGTERM)
+                # Short polling wait — no time.sleep on the write txn.
+                _poll_worker_exit(pid, started_at)
+                if _worker_alive(pid, started_at):
+                    killed = _sigkill(kill, pid)
 
         error = f"elapsed {int(elapsed)}s > limit {limit}s"
         with _kb.write_txn(conn):
@@ -705,6 +873,8 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
+                "worker_start_time = NULL, worker_owner_kind = NULL, "
+                "worker_owner_id = NULL, worker_exit_envelope = NULL, "
                 "last_heartbeat_at = NULL "
                 "WHERE id = ? AND status = 'running' "
                 "  AND worker_pid = ? AND claim_lock IS ?",
@@ -718,6 +888,8 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
                     "sigkill": killed,
                     "retry_status": retry_status,
                 }
+                if termination is not None:
+                    payload.update(termination)
                 run_id = _kb._end_run(
                     conn, tid, outcome="timed_out", status="timed_out",
                     error=error, metadata=payload,
@@ -1431,16 +1603,46 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
     emit a ``spawned`` event carrying them. The fingerprint is what lets every later liveness/kill
     decision tell OUR worker from a process that recycled the PID after a reboot. A failed capture is
     persisted as ``UNVERIFIED_WORKER_FINGERPRINT``, never NULL: NULL is the legacy pre-fingerprint row
-    whose bare-PID kill authority a new spawn must not inherit."""
+    whose bare-PID kill authority a new spawn must not inherit.
+
+    Registry-derived ownership identity (creation-time ``worker_start_time``, ``(owner_kind,
+    owner_id)`` cleanup handle, ``worker_exit_envelope`` path) is stamped from the spawned worker's
+    receipt when the spawn went through ``spawn_worker_process`` in this host process. Rows without it
+    fall back to the fingerprint-only kill path — the same fail-closed semantics as before: a live PID
+    with a fingerprint but no ownership handle is never tree-reclaimed, it is only ever signalled as a
+    single process after identity verification."""
     started_at = _process_fingerprint(int(pid)) or UNVERIFIED_WORKER_FINGERPRINT
+    receipt = get_worker_receipt(int(pid)) or {}
+    start_time = receipt.get("start_time")
+    owner_kind = receipt.get("owner_kind")
+    owner_id = receipt.get("owner_id")
+    exit_envelope = receipt.get("envelope_path")
     with _kb.write_txn(conn):
-        conn.execute("UPDATE tasks SET worker_pid = ?, worker_started_at = ? WHERE id = ?",
-                     (int(pid), started_at, task_id))
+        conn.execute(
+            "UPDATE tasks SET worker_pid = ?, worker_started_at = ?, "
+            "worker_start_time = ?, worker_owner_kind = ?, worker_owner_id = ?, "
+            "worker_exit_envelope = ? WHERE id = ?",
+            (int(pid), started_at, start_time, owner_kind, owner_id, exit_envelope, task_id),
+        )
         run_id = _kb._current_run_id(conn, task_id)
         if run_id is not None:
-            conn.execute("UPDATE task_runs SET worker_pid = ?, worker_started_at = ? WHERE id = ?",
-                         (int(pid), started_at, run_id))
-        _kb._append_event(conn, task_id, "spawned", {"pid": int(pid), "started_at": started_at}, run_id=run_id)
+            conn.execute(
+                "UPDATE task_runs SET worker_pid = ?, worker_started_at = ?, "
+                "worker_start_time = ?, worker_owner_kind = ?, worker_owner_id = ?, "
+                "worker_exit_envelope = ? WHERE id = ?",
+                (int(pid), started_at, start_time, owner_kind, owner_id, exit_envelope, run_id),
+            )
+        _kb._append_event(
+            conn, task_id, "spawned",
+            {
+                "pid": int(pid), "started_at": started_at,
+                "worker_start_time": start_time,
+                "worker_owner_kind": owner_kind,
+                "worker_owner_id": owner_id,
+                "worker_exit_envelope": exit_envelope,
+            },
+            run_id=run_id,
+        )
 
 
 def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:

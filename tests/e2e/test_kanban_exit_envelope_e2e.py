@@ -240,10 +240,12 @@ def test_success_exit_is_booked_as_protocol_violation(sandbox):
         assert row["status"] == "ready"
         assert row["consecutive_failures"] == 0
         assert "protocol violation" in (row["last_failure_error"] or "").casefold()
+        # A clean exit without a terminal kanban call is a typed
+        # ``worker_protocol`` violation run; zero task-budget charge.
         run = conn.execute(
             "SELECT outcome, error FROM task_runs WHERE id=?", (run_id,)
         ).fetchone()
-        assert run["outcome"] == "crashed"
+        assert run["outcome"] == "worker_protocol"
         assert "protocol violation" in (run["error"] or "").casefold()
     finally:
         conn.close()
