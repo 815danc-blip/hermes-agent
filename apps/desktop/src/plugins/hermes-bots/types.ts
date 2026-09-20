@@ -261,6 +261,8 @@ export interface GroupActivityEvent {
   kind: GroupActivityKind
   member?: string
   preview?: string
+  /** Typed failure cause (gateway `data.reason` or the normalized
+   *  `slot_wait_timeout`); absent on non-failures and untyped failures. */
   reason?: string
 }
 
