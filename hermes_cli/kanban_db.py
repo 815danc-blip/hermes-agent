@@ -5112,14 +5112,12 @@ def _detect_crashed_workers_impl(
             )
             if cur.rowcount != 1:
                 continue
+            # Run-outcome label follows main's reaper contract: ``rate_limited``
+            # for quota walls (a phantom crash would misread board history);
+            # everything else records ``crashed`` — budget semantics live in
+            # consecutive_failures / last_failure_error, not the label.
             run_outcome = (
-                "rate_limited"
-                if dead.get("rate_limited")
-                else (
-                    dead["event_kind"]
-                    if dead.get("operational") or dead["event_kind"] == "worker_exit_unknown"
-                    else "crashed"
-                )
+                "rate_limited" if dead.get("rate_limited") else "crashed"
             )
             run_id = _end_run(
                 conn, row["id"],

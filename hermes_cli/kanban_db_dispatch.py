@@ -466,7 +466,14 @@ def _terminate_reclaimed_worker(
         info["signal_refused"] = True
         info["terminated"] = not _kb._pid_alive(pid)
         return info
-    if _kb._pid_alive(pid) and _pid_recycled(pid, started_at):
+    if not _kb._pid_alive(pid):
+        # Already gone: nothing to signal. On Windows ``os.kill`` against a
+        # dead PID raises a plain OSError (winerror 87), not
+        # ProcessLookupError, so without this short-circuit a crashed worker
+        # was reported as "survived" and its claim deferred forever.
+        info["terminated"] = True
+        return info
+    if _pid_recycled(pid, started_at):
         info["terminated"] = True
         info["pid_recycled"] = True
         return info
