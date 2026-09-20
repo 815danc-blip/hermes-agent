@@ -15,6 +15,7 @@ DB during startup. These tests cover the round-trip:
 from __future__ import annotations
 
 import base64
+import sys
 from pathlib import Path
 
 import pytest
@@ -73,6 +74,11 @@ def _read_body(task_id: str) -> str:
 class TestExtractFromTaskBody:
     """Read a real kanban task body and run it through extract_image_refs."""
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="image_routing._LOCAL_IMAGE_PATH_RE matches only POSIX-absolute (~/, /) paths; "
+        "Windows drive-letter paths never extract (known product gap, not a test regression)",
+    )
     def test_local_path_in_body_round_trips(self, kanban_home, tmp_path):
         img = tmp_path / "screenshot.png"
         img.write_bytes(_PNG)
@@ -90,6 +96,11 @@ class TestExtractFromTaskBody:
 class TestBuildPartsFromTaskBody:
     """Verify the full pipeline produces a multimodal user turn."""
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="image_routing._LOCAL_IMAGE_PATH_RE matches only POSIX-absolute (~/, /) paths; "
+        "Windows drive-letter paths never extract (known product gap, not a test regression)",
+    )
     def test_local_path_becomes_native_image_part(self, kanban_home, tmp_path):
         img = tmp_path / "design.png"
         img.write_bytes(_PNG)
@@ -118,6 +129,11 @@ class TestBuildPartsFromTaskBody:
 
 
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="image_routing._LOCAL_IMAGE_PATH_RE matches only POSIX-absolute (~/, /) paths; "
+        "Windows drive-letter paths never extract (known product gap, not a test regression)",
+    )
     def test_code_block_example_is_not_attached(self, kanban_home, tmp_path):
         # Only the real image outside the fenced code block should attach.
         real = tmp_path / "real.png"

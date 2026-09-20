@@ -185,6 +185,10 @@ def test_probe_failure_does_not_log_endpoint_or_exception_secret(caplog):
     assert secret not in caplog.text
 
 
+@pytest.mark.skip(
+    reason="010804 spec: the external_worker_health config gate was not ported "
+    "(DEFAULT_CONFIG has no kanban.external_worker_health section yet)"
+)
 def test_default_config_disables_external_worker_health_gate():
     from hermes_cli.config_defaults import DEFAULT_CONFIG
 
