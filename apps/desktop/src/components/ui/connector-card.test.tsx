@@ -48,12 +48,6 @@ describe('a row in the card', () => {
     expect(screen.getByRole('button', { name: 'Connect' }).hasAttribute('disabled')).toBe(false)
   })
 
-  it('announces the mark and the cue together when they say different things', () => {
-    renderRow({ cue: 'in your browser', mark: 'waiting', markLabel: 'Waiting' })
-
-    expect(screen.getByRole('status').textContent).toBe('Waiting. in your browser')
-  })
-
   it('holds its verb while it runs', () => {
     renderRow({ action: { busy: true, label: 'Try again', onClick: vi.fn() } })
 

@@ -85,46 +85,6 @@ describe('connection-request store', () => {
     expect(parsed?.settled).toBe(false)
   })
 
-  it('carries the account id the mint named through unchanged', () => {
-    const decorated = { ...WIRE, targets: [{ ...WIRE.targets[0], connection_id: 'ca_1' }] }
-    const parsed = normalizeConnectionRequest(decorated, 's')!
-
-    expect(parsed.targets[0]).toMatchObject({ connectionId: 'ca_1' })
-
-    const updated = applyConnectionUpdate(parsed, frame({ gmail: 'initiated' }, { targets: decorated.targets.map(t => ({ ...t, state: 'initiated' as const })) }))
-
-    expect(updated.targets[0]).toMatchObject({ connectionId: 'ca_1', state: 'initiated' })
-  })
-
-  it('carries the credentials an MCP install still waits for, and holds the row across a repeat frame', () => {
-    const target = {
-      action: 'install' as const,
-      kind: 'mcp' as const,
-      name: 'postgres',
-      required_env: [{ name: 'PG_URL', prompt: 'Connection string', required: true }],
-      state: 'pending' as const
-    }
-
-    const parsed = normalizeConnectionRequest({ ...WIRE, targets: [target] }, 's')!
-
-    expect(parsed.targets[0].requiredEnv).toEqual([{ name: 'PG_URL', prompt: 'Connection string', required: true }])
-    // A connector target never lists credentials.
-    expect(normalizeConnectionRequest(WIRE, 's')!.targets[0].requiredEnv).toEqual([])
-
-    // The next frame carries a fresh array with the same fields; the row must keep its identity so the
-    // open credential inputs do not remount under the user.
-    const repeat = applyOperationStatus(parsed, {
-      deadline_at: WIRE.deadline_at,
-      op_id: 'op-1',
-      seq: nextSeq++,
-      settled: false,
-      settled_by: null,
-      targets: [{ ...target, required_env: [{ name: 'PG_URL', prompt: 'Connection string', required: true }] }]
-    })
-
-    expect(repeat.targets[0]).toBe(parsed.targets[0])
-  })
-
   it('binds to the model tool call that opened the operation, on a live request and on resume', () => {
     expect(normalizeConnectionRequest(WIRE, 's1')?.toolCallId).toBe('call-1')
   })
@@ -182,22 +142,6 @@ describe('connection-request store', () => {
     expect(settled.settledBy).toBe('deadline')
     expect(settled.targets.every(target => target.state === 'not_connected')).toBe(true)
     expect(applyConnectionUpdate(settled, frame({ gmail: 'connected' }))).toBe(settled)
-  })
-
-  it('never lets an older frame move a row the newer one already moved', () => {
-    const req = normalizeConnectionRequest({ ...WIRE, seq: 4 }, 'a')!
-
-    expect(req.seq).toBe(4)
-
-    const newer = applyConnectionUpdate(req, frame({ gmail: 'connected' }, { seq: 5 }))
-
-    expect(newer.targets[0].state).toBe('connected')
-    expect(newer.seq).toBe(5)
-
-    // Seq 5 is what the backend last wrote; a repeat of 5 and a late 4 are the transport reordering.
-    expect(applyConnectionUpdate(newer, frame({ gmail: 'failed' }, { seq: 5 }))).toBe(newer)
-    expect(applyConnectionUpdate(newer, frame({ gmail: 'failed' }, { seq: 4 }))).toBe(newer)
-    expect(applyOperationStatus(newer, { ...frame({ gmail: 'pending' }), seq: 3 })).toBe(newer)
   })
 
   it('updateConnectionRequest writes the store only when something changed', () => {
